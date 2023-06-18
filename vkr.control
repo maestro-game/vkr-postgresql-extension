@@ -1,0 +1,4 @@
+comment = 'VKR KPFU ITIS'
+default_version = '0.1'
+module_pathname = '$libdir/vkr'
+relocatable = false
