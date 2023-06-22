@@ -35,26 +35,6 @@ typedef struct
     char string[];
 } MMPT;
 
-void mylog_s(char *str) {
-    elog(INFO, "%s", str);
-}
-
-void mylog(int16_t num)
-{
-    elog(INFO, "here %ld", num);
-}
-
-void log_bytea(bytea *in)
-{
-    Oid argtypes[] = {BYTEAOID};
-    Datum qvalues[1];
-    qvalues[0] = PointerGetDatum(in);
-    SPI_connect();
-    SPI_execute_plan(SPI_prepare("SELECT encode($1, 'hex')", 1, argtypes), qvalues, NULL, true, 1);
-    elog(INFO, "%s", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-    SPI_finish();
-}
-
 PG_FUNCTION_INFO_V1(mmpt_in);
 Datum mmpt_in(PG_FUNCTION_ARGS)
 {
@@ -140,17 +120,26 @@ void init_digest()
     mdctx = EVP_MD_CTX_new();
 }
 
+#define name_to_oid(name) DatumGetObjectId(DirectFunctionCall1(to_regclass, CStringGetTextDatum(name)))
+
+bool validate_hash(uint8_t input[], uint16_t input_len, uint8_t expected[])
+{
+    EVP_DigestInit_ex(mdctx, md, NULL);
+    EVP_DigestUpdate(mdctx, input, input_len);
+    uint8_t *actual = (uint8_t *)palloc(mmpt->hash_len);
+    EVP_DigestFinal_ex(mdctx, actual, NULL);
+    return memcmp(actual, expected, mmpt->hash_len) == 0;
+}
+
 bool validate_value_hash(uint8_t hash[])
 {
     ScanKeyData skey[1];
-    Oid tbl_oid = name_to_oid(pspring("%s_v", mmpt->string));
+    Oid tbl_oid = name_to_oid(psprintf("%s_v", mmpt->string));
     Oid idx_oid = name_to_oid(psprintf("%s_v_pkey", mmpt->string));
     uint16 struct_len = mmpt->hash_len + VARHDRSZ;
     bytea *hash_bytea = (bytea *)palloc(struct_len);
     SET_VARSIZE(hash_bytea, struct_len);
     memcpy(VARDATA(hash_bytea), hash, mmpt->hash_len);
-
-    log_bytea(hash_bytea);
 
     Relation rel = table_open(tbl_oid, AccessShareLock);
     Relation idxrel = index_open(idx_oid, AccessShareLock);
@@ -177,15 +166,6 @@ bool validate_value_hash(uint8_t hash[])
     return validate_hash(VARDATA(value_bytea), VARSIZE_ANY_EXHDR(value_bytea), hash);
 }
 
-bool validate_hash(uint8_t input[], uint16_t input_len, uint8_t expected[])
-{
-    EVP_DigestInit_ex(mdctx, md, NULL);
-    EVP_DigestUpdate(mdctx, input, input_len);
-    uint8_t *actual = (uint8_t *)palloc(mmpt->hash_len);
-    EVP_DigestFinal_ex(mdctx, actual, NULL);
-    return memcmp(actual, expected, mmpt->hash_len) == 0;
-}
-
 bytea *hash(uint8_t input[], uint16_t input_len)
 {
     EVP_DigestInit_ex(mdctx, md, NULL);
@@ -197,19 +177,51 @@ bytea *hash(uint8_t input[], uint16_t input_len)
     return hash_bytea;
 }
 
-#define name_to_oid(name) DatumGetObjectId(DirectFunctionCall1(to_regclass, CStringGetTextDatum(name)))
+// r - 0, _ - 1, v - 2
+bool hash_exists(bytea *hash_bytea, int table_specie)
+{
+    ScanKeyData skey[1];
+    Oid tbl_oid;
+    Oid idx_oid;
+    if (table_specie == 1) {
+        tbl_oid = name_to_oid(mmpt->string);
+        idx_oid = name_to_oid(psprintf("%s_pkey", mmpt->string));
+    } else {
+        if (table_specie == 0) {
+            tbl_oid = name_to_oid(psprintf("%s_r", mmpt->string));
+            idx_oid = name_to_oid(psprintf("%s_r_pkey", mmpt->string));
+        } else {
+            tbl_oid = name_to_oid(psprintf("%s_v", mmpt->string));
+            idx_oid = name_to_oid(psprintf("%s_v_pkey", mmpt->string));
+        }
+    }
+    Relation rel = table_open(tbl_oid, AccessShareLock);
+    Relation idxrel = index_open(idx_oid, AccessShareLock);
+    IndexScanDesc scan = index_beginscan(rel, idxrel, GetTransactionSnapshot(), 1, 0);
+    ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash_bytea));
+    index_rescan(scan, skey, 1, NULL, 0);
+    TupleTableSlot* slot = table_slot_create(rel, NULL);
+    bool result = index_getnext_slot(scan, ForwardScanDirection, slot);
+    index_endscan(scan);
+    ExecDropSingleTupleTableSlot(slot);
+    index_close(idxrel, AccessShareLock);
+    table_close(rel, AccessShareLock);
+    return result;
+}
 
 bytea *write_mmpt_value()
 {
-    bool nulls[] = {false, false};
-    Oid tbl_oid = name_to_oid(psprintf("%s_v", mmpt->string));
-    Relation rel = table_open(tbl_oid, RowExclusiveLock);
     bytea *hash_bytea = hash(VARDATA(value), VARSIZE_ANY_EXHDR(value));
-    Datum values[] = {PointerGetDatum(hash_bytea), PointerGetDatum(value)};
-    HeapTuple tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-    CatalogTupleInsert(rel, tup);
-    heap_freetuple(tup);
-    table_close(rel, RowExclusiveLock);
+    if (!hash_exists(hash_bytea, 2)) {
+        bool nulls[] = {false, false};
+        Oid tbl_oid = name_to_oid(psprintf("%s_v", mmpt->string));
+        Relation rel = table_open(tbl_oid, RowExclusiveLock);
+        Datum values[] = {PointerGetDatum(hash_bytea), PointerGetDatum(value)};
+        HeapTuple tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+        CatalogTupleInsert(rel, tup);
+        heap_freetuple(tup);
+        table_close(rel, RowExclusiveLock);
+    }
     return hash_bytea;
 }
 
@@ -222,8 +234,6 @@ uint8_t *get_node_non_root(uint8_t hash[])
     bytea *hash_bytea = (bytea *)palloc(struct_len);
     SET_VARSIZE(hash_bytea, struct_len);
     memcpy(VARDATA(hash_bytea), hash, mmpt->hash_len);
-
-    log_bytea(hash_bytea);
 
     Relation rel = table_open(tbl_oid, AccessShareLock);
     Relation idxrel = index_open(idx_oid, AccessShareLock);
@@ -259,8 +269,6 @@ uint8_t *get_root_node(uint8_t hash[])
     SET_VARSIZE(hash_bytea, struct_len);
     memcpy(VARDATA(hash_bytea), hash, mmpt->hash_len);
 
-    log_bytea(hash_bytea);
-
     Relation rel = table_open(tbl_oid, AccessShareLock);
     Relation idxrel = index_open(idx_oid, AccessShareLock);
     IndexScanDesc scan = index_beginscan(rel, idxrel, GetTransactionSnapshot(), 1, 0);
@@ -288,34 +296,30 @@ uint8_t *get_root_node(uint8_t hash[])
 uint8_t *get_node_by_hash(uint8_t hash[], bool is_root)
 {
     if (!is_root) {
-        elog(INFO, "non-root");
         return get_node_non_root(hash);
     } 
     else {
-        elog(INFO, "root");
         return get_root_node(hash);
     }
 }
 
 uint8_t *save_node_no_root(uint8_t content[], uint16_t content_len)
 {
-    mylog(1010);
-    bool nulls[] = {false, false};
-    Oid tbl_oid = name_to_oid(mmpt->string);
-    Relation rel = table_open(tbl_oid, RowExclusiveLock);
     bytea *hash_bytea = hash(content, content_len);
-    uint16 struct_len = content_len + VARHDRSZ;
-    bytea *content_bytea = (bytea *)palloc(struct_len);
-    SET_VARSIZE(content_bytea, struct_len);
-    memcpy(VARDATA(content_bytea), content, content_len);
-    Datum values[] = {PointerGetDatum(hash_bytea), PointerGetDatum(content_bytea)};
-    HeapTuple tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);;
-    mylog(1011);
-    CatalogTupleInsert(rel, tup);
-    mylog(1012);
-    heap_freetuple(tup);
-    table_close(rel, RowExclusiveLock);
-    log_bytea(hash_bytea);
+    if (!hash_exists(hash_bytea, 1)) {
+        bool nulls[] = {false, false};
+        Oid tbl_oid = name_to_oid(mmpt->string);
+        Relation rel = table_open(tbl_oid, RowExclusiveLock);
+        uint16 struct_len = content_len + VARHDRSZ;
+        bytea *content_bytea = (bytea *)palloc(struct_len);
+        SET_VARSIZE(content_bytea, struct_len);
+        memcpy(VARDATA(content_bytea), content, content_len);
+        Datum values[] = {PointerGetDatum(hash_bytea), PointerGetDatum(content_bytea)};
+        HeapTuple tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);;
+        CatalogTupleInsert(rel, tup);
+        heap_freetuple(tup);
+        table_close(rel, RowExclusiveLock);
+    }
     return VARDATA(hash_bytea);
 }
 
@@ -323,23 +327,25 @@ bytea *new_root = NULL;
 
 uint8_t *save_root(uint8_t content[], uint16_t content_len)
 {
-    bool nulls[] = {false, false, false};
-    Oid tbl_oid = name_to_oid(psprintf("%s_r", mmpt->string));
-    Oid pkey_seq_oid = name_to_oid(psprintf("%s_r_id_seq", mmpt->string));
-    int32 next_id = DatumGetInt32(DirectFunctionCall1(nextval_oid, ObjectIdGetDatum(pkey_seq_oid)));
-
-    Relation rel = table_open(tbl_oid, RowExclusiveLock);
     bytea *hash_bytea = hash(content, content_len);
-    uint16 struct_len = content_len + VARHDRSZ;
-    bytea *content_bytea = (bytea *)palloc(struct_len);
-    SET_VARSIZE(content_bytea, struct_len);
-    memcpy(VARDATA(content_bytea), content, content_len);
+    if (!hash_exists(hash_bytea, 0)) {
+        bool nulls[] = {false, false, false};
+        Oid tbl_oid = name_to_oid(psprintf("%s_r", mmpt->string));
+        Oid pkey_seq_oid = name_to_oid(psprintf("%s_r_id_seq", mmpt->string));
+        int32 next_id = DatumGetInt32(DirectFunctionCall1(nextval_oid, ObjectIdGetDatum(pkey_seq_oid)));
 
-    Datum values[] = {PointerGetDatum(hash_bytea), Int32GetDatum(next_id), PointerGetDatum(content_bytea)};
-    HeapTuple tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-    CatalogTupleInsert(rel, tup);
-    heap_freetuple(tup);
-    table_close(rel, RowExclusiveLock);
+        Relation rel = table_open(tbl_oid, RowExclusiveLock);
+        uint16 struct_len = content_len + VARHDRSZ;
+        bytea *content_bytea = (bytea *)palloc(struct_len);
+        SET_VARSIZE(content_bytea, struct_len);
+        memcpy(VARDATA(content_bytea), content, content_len);
+
+        Datum values[] = {PointerGetDatum(hash_bytea), Int32GetDatum(next_id), PointerGetDatum(content_bytea)};
+        HeapTuple tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+        CatalogTupleInsert(rel, tup);
+        heap_freetuple(tup);
+        table_close(rel, RowExclusiveLock);
+    }
     new_root = hash_bytea;
     return VARDATA(hash_bytea);
 }
@@ -377,9 +383,7 @@ Datum insert_in_trie(PG_FUNCTION_ARGS)
         root = PG_GETARG_BYTEA_P(1)->vl_dat;
     }
     init_digest();
-    // SPI_connect();
-    insert(root, key->vl_dat, VARSIZE_ANY_EXHDR(key) * 2, mmpt->hash_len);
-    // SPI_finish();
+    insert(root, VARDATA(key), VARSIZE_ANY_EXHDR(key) * 2, mmpt->hash_len);
 
     PG_RETURN_BYTEA_P(new_root);
 }
@@ -392,9 +396,7 @@ Datum find_in_trie(PG_FUNCTION_ARGS)
     uint8_t *root = PG_GETARG_BYTEA_P(1)->vl_dat;
     bytea *key = PG_GETARG_BYTEA_P(2);
 
-    // SPI_connect();
-    uint8_t *val = get_value(root, key->vl_dat, VARSIZE_ANY_EXHDR(key) * 2, mmpt->hash_len);
-    // SPI_finish();
+    uint8_t *val = get_value(root, VARDATA(key), VARSIZE_ANY_EXHDR(key) * 2, mmpt->hash_len);
     if (val == NULL)
         PG_RETURN_NULL();
 

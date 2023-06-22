@@ -4,9 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-void mylog(int16_t num);
-void mylog_s(char *str);
-
 bool validate_hash(uint8_t input[], uint16_t input_len, uint8_t expected[]);
 bool validate_value_hash(uint8_t hash[]);
 

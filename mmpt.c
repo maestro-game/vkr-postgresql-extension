@@ -19,15 +19,16 @@
 #define BRANCH_VALUE 1 + hash_len *BRANCHES_AMOUNT
 
 #define get_branch_child(branch, pos) branch + BRANCH_ON_POS(pos)
-#define node_first_len(node) (node[0] & 0b00011111)
+#define node_first_len(node) (node[0] & 0b00111111 | node[0] & (0b10000000 >> 1))
 #define get_path_mem_size(node) ((node_first_len(node) >> 1) + (node_first_len(node) & 1))
-#define is_ext(node) (node[0] & 0b11000000) == 0
-#define is_leaf(node) (node[0] & 0b11000000) == 0b01000000
-#define is_branch(node) (node[0] & 0b10000000) == 0b10000000
 
 #define EXT_PREF 0b00000000    // last 6 bits for size of array
-#define LEAF_PREF 0b01000000   // last 6 bits for size of array
-#define BRANCH_PREF 0b10000000 // last 6 bits for size of array
+#define BRANCH_PREF 0b01000000 // last 6 bits for size of array
+#define LEAF_PREF 0b10000000   // last 7 bits for size of array
+
+#define is_ext(node) (node[0] & 0b11000000) == EXT_PREF
+#define is_leaf(node) (node[0] & 0b10000000) == LEAF_PREF
+#define is_branch(node) (node[0] & 0b11000000) == BRANCH_PREF
 
 #define FINALIZE_EXT(ext, ext_len, is_root) save_node(ext, ext_len, is_root)
 #define FINALIZE_LEAF(leaf, leaf_len, is_root) save_node_with_value(leaf, leaf_len, is_root, leaf + LEAF_VALUE)
@@ -64,17 +65,14 @@ uint8_t *create_leaf_hash(uint8_t path[], uint8_t path_len, bool offset, bool is
     if (set_val != NULL)
     {
         memcpy(leaf + LEAF_VALUE, set_val, hash_len);
-        mylog(157);
         return FINALIZE_LEAF_WITHOUT_VAL(leaf, leaf_len, is_root);
     }
     else
     {
-        mylog(158);
         return FINALIZE_LEAF(leaf, leaf_len, is_root);
     }
 }
 
-// child_node - hash of child node
 uint8_t *create_extension_hash(uint8_t path[], uint8_t path_len, uint8_t *child_node, bool offset, bool is_root)
 {
     if (path_len == 0)
@@ -142,39 +140,41 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
     uint8_t node_counter = 0;
     uint8_t hash_counter = 0;
 
-    uint8_t *prev = root;
+    uint8_t *prev = NULL;
     uint8_t *node = root;
     uint8_t *hash_path[MAX_KEY_LEN];
     uint8_t *node_path[MAX_KEY_LEN];
     while (1)
     {
-        mylog(node[0]);
         if (is_branch(node))
         {
             uint8_t *old_prev = prev;
             node = copy_branch(node);
-            mylog(100);
             if (i == key_len)
             {
                 node[0] = BRANCH_PREF | 1;
-                memcpy(prev, FINALIZE_BRANCH_WITH_VAL(node, prev == root), hash_len);
-                mylog(101);
+                if (prev != NULL) {
+                    memcpy(prev, FINALIZE_BRANCH_WITH_VAL(node, false), hash_len);
+                } else {
+                    FINALIZE_BRANCH_WITH_VAL(node, true);
+                }
                 break;
             }
             prev = get_branch_child(node, get_nibble(key, i));
-            mylog(102);
             i++;
             if (isZeros(prev, hash_len))
             {
                 memcpy(prev, create_leaf_hash(key + (i >> 1), key_len - i, i & 1, false, NULL), hash_len);
-                memcpy(old_prev, FINALIZE_BRANCH_WITHOUT_VAL(node, prev == root), hash_len);
-                mylog(103);
+                if (old_prev != NULL) {
+                    memcpy(old_prev, FINALIZE_BRANCH_WITHOUT_VAL(node, false), hash_len);
+                } else {
+                    FINALIZE_BRANCH_WITHOUT_VAL(node, true);
+                }
                 break;
             }
             node_path[node_counter++] = node;
             hash_path[hash_counter++] = prev;
             node = get_node_by_hash(prev, false);
-            mylog(104);
         }
         else if (is_leaf(node))
         {
@@ -187,9 +187,12 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
             }
             if (i == key_len && com_pref_len == node_len)
             {
-                mylog(505);
-                memcpy(prev, FINALIZE_LEAF(copy_leaf(node), LEAF_PATH + (node_len >> 1) + (node_len & 1), prev == root), hash_len);
-                mylog(50);
+                uint8_t *copy = copy_leaf(node);
+                if (prev != NULL) {
+                    memcpy(prev, FINALIZE_LEAF(copy, LEAF_PATH + (node_len >> 1) + (node_len & 1), false), hash_len);
+                } else {
+                    FINALIZE_LEAF(copy, LEAF_PATH + (node_len >> 1) + (node_len & 1), true);
+                }
                 break;
             }
             else
@@ -197,24 +200,19 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
                 uint8_t *old_leaf = node;
                 if (i == key_len)
                 {
-                    mylog(51);
                     node = create_branch(true);
-                    mylog(52);
                     uint8_t *child = get_branch_child(node, get_nibble(old_leaf + LEAF_PATH, com_pref_len));
                     com_pref_len++;
                     uint8_t *new_leaf = create_leaf_hash(old_leaf + LEAF_PATH + (com_pref_len >> 1), node_len - com_pref_len, com_pref_len & 1, false, old_leaf + LEAF_VALUE);
                     memcpy(child, new_leaf, hash_len);
-                    mylog(53);
                     com_pref_len--;
-                    node = FINALIZE_BRANCH_WITH_VAL(node, prev == root && com_pref_len == 0);
+                    node = FINALIZE_BRANCH_WITH_VAL(node, prev == NULL && com_pref_len == 0);
                 }
                 else
                 {
                     if (node_len == com_pref_len)
                     {
-                        mylog(54);
                         node = create_branch(true);
-                        mylog(55);
                         memcpy(node + BRANCH_VALUE, old_leaf + LEAF_VALUE, hash_len);
                         uint8_t *child = get_branch_child(node, get_nibble(key, i));
                         i++;
@@ -222,29 +220,24 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
                     }
                     else
                     {
-                        mylog(56);
                         node = create_branch(false);
                         uint8_t *child = get_branch_child(node, get_nibble(key, i));
                         i++;
-                        mylog(57);
                         memcpy(child, create_leaf_hash(key + (i >> 1), key_len - i, i & 1, false, NULL), hash_len);
                         child = get_branch_child(node, get_nibble(old_leaf + LEAF_PATH, com_pref_len));
                         com_pref_len++;
-                        mylog(58);
                         memcpy(child, create_leaf_hash(old_leaf + LEAF_PATH + (com_pref_len >> 1), node_len - com_pref_len, com_pref_len & 1, false, old_leaf + LEAF_VALUE), hash_len);
                         com_pref_len--;
                     }
-                    node = FINALIZE_BRANCH_WITHOUT_VAL(node, prev == root && com_pref_len == 0);
-                    mylog(59);
+                    node = FINALIZE_BRANCH_WITHOUT_VAL(node, prev == NULL && com_pref_len == 0);
                 }
 
                 if (com_pref_len != 0)
                 {
-                    mylog(60);
-                    node = create_extension_hash(old_leaf + LEAF_PATH, com_pref_len, node, false, prev == root);
+                    node = create_extension_hash(old_leaf + LEAF_PATH, com_pref_len, node, false, prev == NULL);
                 }
             }
-            memcpy(prev, node, hash_len);
+            if (prev != NULL) memcpy(prev, node, hash_len);
             break;
         }
         else // EXTENSION CASE
@@ -258,7 +251,6 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
             }
             if (com_pref_len == node_len)
             {
-                mylog(1000);
                 node = copy_ext(node);
                 node_path[node_counter++] = node;
                 prev = node + EXT_LINK;
@@ -269,16 +261,14 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
                 uint8_t *old_ext = node;
                 if (i == key_len)
                 {
-                    mylog(1001);
                     node = create_branch(true);
                     uint8_t *child = get_branch_child(node, get_nibble(old_ext + EXT_PATH, com_pref_len));
                     com_pref_len++;
                     memcpy(child, create_extension_hash(old_ext + EXT_PATH + (com_pref_len >> 1), node_len - com_pref_len, old_ext + EXT_LINK, com_pref_len & 1, false), hash_len);
-                    node = FINALIZE_BRANCH_WITH_VAL(node, prev == root && com_pref_len == 0);
+                    node = FINALIZE_BRANCH_WITH_VAL(node, prev == NULL && com_pref_len == 0);
                 }
                 else
                 {
-                    mylog(1002);
                     node = create_branch(false);
                     uint8_t *child = get_branch_child(node, get_nibble(old_ext + EXT_PATH, com_pref_len));
                     com_pref_len++;
@@ -286,16 +276,15 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
                     child = get_branch_child(node, get_nibble(key, i));
                     i++;
                     memcpy(child, create_leaf_hash(key + (i >> 1), key_len - i, i & 1, false, NULL), hash_len);
-                    node = FINALIZE_BRANCH_WITHOUT_VAL(node, prev == root && com_pref_len == 0);
+                    node = FINALIZE_BRANCH_WITHOUT_VAL(node, prev == NULL && com_pref_len == 0);
                 }
 
                 com_pref_len--;
                 if (com_pref_len != 0)
                 {
-                    mylog(1003);
-                    node = create_extension_hash(old_ext + EXT_PATH, com_pref_len, node, false, prev == root);
+                    node = create_extension_hash(old_ext + EXT_PATH, com_pref_len, node, false, prev == NULL);
                 }
-                memcpy(prev, node, hash_len);
+                if (prev != NULL) memcpy(prev, node, hash_len);
                 break;
             }
         }
@@ -304,7 +293,6 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
     prev = NULL;
     while (node_counter != 255)
     {
-        mylog(1004);
         uint8_t *node = node_path[node_counter];
         if (is_branch(node))
         {
@@ -325,16 +313,12 @@ void insert(uint8_t *root, uint8_t key[], size_t key_len, uint16_t in_hash_len)
 uint8_t *get_value(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t in_hash_len)
 {
     hash_len = in_hash_len;
-    mylog_s("get val - 1");
-    mylog(root[0]);
     root = get_node_by_hash(root, true);
-    mylog_s("get val - 2");
     u_int8_t i = 0;
     while (1)
     {
         if (is_branch(root))
         {
-            mylog_s("get val - branch 1");
             if (i == key_len)
             {
                 if (root[0] & 1)
@@ -355,7 +339,6 @@ uint8_t *get_value(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t in_h
             uint8_t com_pref_len = 0;
             if (is_leaf(root))
             {
-                mylog(777);
                 while (i != key_len && com_pref_len != node_len && get_nibble(key, i) == get_nibble(root + LEAF_PATH, com_pref_len))
                 {
                     i++;
@@ -369,7 +352,6 @@ uint8_t *get_value(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t in_h
             }
             else
             {
-                mylog(333);
                 while (i != key_len && com_pref_len != node_len && get_nibble(key, i) == get_nibble(root + EXT_PATH, com_pref_len))
                 {
                     i++;
@@ -394,26 +376,26 @@ uint8_t *get_value(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t in_h
 uint8_t *merkle_proof(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t in_hash_len)
 {
     hash_len = in_hash_len;
-    mylog_s("mrk prf - 1");
-    mylog(root[0]);
     uint8_t *root_hash = root;
     root = get_node_by_hash(root, true);
-    mylog_s("mrk prf - 2");
     u_int8_t i = 0;
     while (1)
     {
         if (is_branch(root))
         {
-            mylog_s("mrk prf - branch 1");
-            if (!validate_hash(root, BRANCH_VALUE + hash_len * root[0], root_hash))
+            if (!validate_hash(root, BRANCH_VALUE + hash_len * (root[0] & 1), root_hash))
             {
                 return root_hash;
             }
             if (i == key_len)
             {
-                if ((root[0] & 1) && validate_value_hash(root + BRANCH_VALUE))
+                if ((root[0] & 1))
                 {
-                    return NULL;
+                    if (validate_value_hash(root + BRANCH_VALUE)) {
+                        return NULL;
+                    } else {
+                        return root + BRANCH_VALUE;
+                    }
                 }
                 break;
             }
@@ -429,21 +411,31 @@ uint8_t *merkle_proof(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t i
             uint8_t com_pref_len = 0;
             if (is_leaf(root))
             {
-                mylog_s("mrk prf - leaf 1");
+                if (!validate_hash(root, LEAF_PATH + (node_len >> 1) + (node_len & 1), root_hash))
+                {
+                    return root_hash;
+                }
                 while (i != key_len && com_pref_len != node_len && get_nibble(key, i) == get_nibble(root + LEAF_PATH, com_pref_len))
                 {
                     i++;
                     com_pref_len++;
                 }
-                if (i == key_len && com_pref_len == node_len && validate_value_hash(root + LEAF_VALUE))
+                if (i == key_len && com_pref_len == node_len)
                 {
-                    return NULL;
+                    if (validate_value_hash(root + LEAF_VALUE)) {
+                        return NULL;
+                    } else {
+                        return root + LEAF_VALUE;
+                    }
                 }
                 break;
             }
             else
             {
-                mylog_s("mrk prf - ext 1");
+                if (!validate_hash(root, EXT_PATH + (node_len >> 1) + (node_len & 1), root_hash))
+                {
+                    return root_hash;
+                }
                 while (i != key_len && com_pref_len != node_len && get_nibble(key, i) == get_nibble(root + EXT_PATH, com_pref_len))
                 {
                     i++;
@@ -468,54 +460,45 @@ uint8_t *merkle_proof(uint8_t *root, uint8_t key[], uint32_t key_len, uint16_t i
 
 uint8_t *validate_rec(uint8_t *root, bool is_root)
 {
-    mylog_s("vld all - 1");
-    mylog(root[0]);
     uint8_t *root_hash = root;
     root = get_node_by_hash(root, is_root);
-    mylog_s("vld all - 2");
-    while (1)
+    if (is_branch(root))
     {
-        if (is_branch(root))
+        if (!validate_hash(root, BRANCH_VALUE + hash_len * (root[0] & 1), root_hash))
         {
-            mylog_s("vld all - branch 1");
-            if (!validate_hash(root, BRANCH_VALUE + hash_len * root[0], root_hash))
+            return root_hash;
+        }
+        if ((root[0] & 1) && !validate_value_hash(root + BRANCH_VALUE))
+        {
+            return root_hash;
+        }
+        for (uint8_t i = 0; i < BRANCHES_AMOUNT; i++)
+        {
+            root_hash = get_branch_child(root, i);
+            if (isZeros(root_hash, hash_len))
+                continue;
+            root_hash = validate_rec(root_hash, false);
+            if (root_hash != NULL) 
             {
                 return root_hash;
             }
-            if ((root[0] & 1) && !validate_value_hash(root + BRANCH_VALUE))
+        }
+    }
+    else
+    {
+        if (is_leaf(root))
+        {
+            if (!validate_value_hash(root + LEAF_VALUE))
             {
-                return root_hash;
-            }
-            for (uint8_t i = 0; i < BRANCHES_AMOUNT; i++)
-            {
-                root_hash = get_branch_child(root, i);
-                if (isZeros(root_hash, hash_len))
-                    continue;
-                root_hash = validate_rec(root_hash, false);
-                if (root_hash != NULL) 
-                {
-                    return root_hash;
-                }
+                return root + LEAF_VALUE;
             }
         }
         else
         {
-            if (is_leaf(root))
+            root_hash = validate_rec(root + EXT_LINK, false);
+            if (root_hash != NULL) 
             {
-                mylog_s("vld all - leaf 1");
-                if (!validate_value_hash(root + LEAF_VALUE))
-                {
-                    return root + LEAF_VALUE;
-                }
-            }
-            else
-            {
-                mylog_s("vld all - ext 1");
-                root_hash = validate_rec(root + EXT_LINK, false);
-                if (root_hash != NULL) 
-                {
-                    return root_hash;
-                }
+                return root_hash;
             }
         }
     }
